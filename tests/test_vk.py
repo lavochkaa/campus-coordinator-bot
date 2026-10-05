@@ -11,8 +11,8 @@ from app.vk import (
     VK_WEB_BASE_URL,
     VKAPIClient,
     VKAPIError,
+    _message_chunks,
     needs_cursor_rebase,
-    safe_excerpt,
     source_wall_posts,
     with_vk_retries,
 )
@@ -66,9 +66,12 @@ async def test_vk_rate_limit_is_retried(monkeypatch: pytest.MonkeyPatch) -> None
     assert attempts == 2
 
 
-def test_safe_excerpt_strips_whitespace_and_limits_size() -> None:
-    assert safe_excerpt(" one\n two ") == "one two"
-    assert safe_excerpt("abcdef", limit=4) == "abcd…"
+def test_vk_post_chunks_preserve_text_and_fit_telegram_utf16_limit() -> None:
+    source = ("абв😀\n" * 1000) + "конец"
+    chunks = _message_chunks(source)
+
+    assert "".join(chunks) == source
+    assert all(len(chunk.encode("utf-16-le")) // 2 <= 3400 for chunk in chunks)
 
 
 def test_source_wall_posts_excludes_foreign_entries_and_keeps_own_post_url() -> None:
@@ -76,12 +79,37 @@ def test_source_wall_posts_excludes_foreign_entries_and_keeps_own_post_url() -> 
         -73332691,
         [
             {"id": 10031, "from_id": -212881136, "owner_id": -73332691, "date": 1, "text": "чужой"},
-            {"id": 5342, "from_id": -73332691, "owner_id": -73332691, "date": 2, "text": "свой"},
+            {
+                "id": 5342,
+                "from_id": -73332691,
+                "owner_id": -73332691,
+                "date": 2,
+                "text": "свой",
+                "attachments": [
+                    {
+                        "type": "photo",
+                        "photo": {
+                            "sizes": [
+                                {"url": "https://cdn.example/small.jpg", "width": 100, "height": 100},
+                                {"url": "https://cdn.example/large.jpg", "width": 1000, "height": 1000},
+                            ]
+                        },
+                    },
+                    {"type": "video", "video": {"owner_id": -73332691, "id": 9, "title": "Видео"}},
+                    {"type": "link", "link": {"title": "Сайт", "url": "https://example.com"}},
+                ],
+            },
         ],
     )
 
     assert [post.post_id for post in posts] == [5342]
     assert posts[0].url == "https://vk.ru/wall-73332691_5342"
+    assert posts[0].text == "свой"
+    assert posts[0].photos == ("https://cdn.example/large.jpg",)
+    assert posts[0].attachment_links == (
+        ("Видео", "https://vk.ru/video-73332691_9"),
+        ("Сайт", "https://example.com"),
+    )
 
 
 def test_cursor_rebases_if_legacy_value_belongs_to_foreign_entry() -> None:

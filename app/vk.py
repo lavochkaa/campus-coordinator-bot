@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 import structlog
 from aiogram.enums import ParseMode
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
@@ -23,6 +24,7 @@ from app.telegram import TopicMessenger
 log = structlog.get_logger(__name__)
 VK_API_BASE_URL = "https://api.vk.ru/method"
 VK_WEB_BASE_URL = "https://vk.ru"
+MAX_VK_PHOTO_BYTES = 10 * 1024 * 1024
 _COMMUNITY = re.compile(r"^(?:(?:https?://)?(?:www\.)?vk\.(?:ru|com)/)?([A-Za-z0-9_.-]+)$", re.IGNORECASE)
 
 
@@ -46,6 +48,8 @@ class VKWallPost:
     published_at: datetime
     text: str
     url: str
+    photos: tuple[str, ...] = ()
+    attachment_links: tuple[tuple[str, str], ...] = ()
 
 
 class VKAPIClient:
@@ -130,9 +134,64 @@ def source_wall_posts(owner_id: int, items: list[object]) -> list[VKWallPost]:
                 published_at=datetime.fromtimestamp(int(item.get("date", 0)), tz=UTC),
                 text=str(item.get("text") or ""),
                 url=f"{VK_WEB_BASE_URL}/wall{actual_owner_id}_{post_id}",
+                photos=tuple(_photo_urls(item.get("attachments"))),
+                attachment_links=tuple(_attachment_links(item.get("attachments"))),
             )
         )
     return result
+
+
+def _photo_urls(attachments: object) -> list[str]:
+    """Pick the largest available image from each VK photo attachment."""
+    urls: list[str] = []
+    if not isinstance(attachments, list):
+        return urls
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or attachment.get("type") != "photo":
+            continue
+        photo = attachment.get("photo")
+        sizes = photo.get("sizes") if isinstance(photo, dict) else None
+        if not isinstance(sizes, list):
+            continue
+        candidates = [size for size in sizes if isinstance(size, dict) and isinstance(size.get("url"), str)]
+        if candidates:
+            largest = max(
+                candidates,
+                key=lambda size: _dimension(size.get("width")) * _dimension(size.get("height")),
+            )
+            urls.append(largest["url"])
+    return urls
+
+
+def _dimension(value: object) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _attachment_links(attachments: object) -> list[tuple[str, str]]:
+    """Expose non-photo attachments as links so their context is not lost."""
+    links: list[tuple[str, str]] = []
+    if not isinstance(attachments, list):
+        return links
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        kind = attachment.get("type")
+        item = attachment.get(kind) if isinstance(kind, str) else None
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        label = str(kind or "Вложение")
+        if kind == "link" and isinstance(url, str):
+            label = str(item.get("title") or "Ссылка")
+        elif kind == "video" and isinstance(item.get("owner_id"), int) and isinstance(item.get("id"), int):
+            url = f"{VK_WEB_BASE_URL}/video{item['owner_id']}_{item['id']}"
+            label = str(item.get("title") or "Видео ВК")
+        elif kind == "wall" and isinstance(item.get("owner_id"), int) and isinstance(item.get("id"), int):
+            url = f"{VK_WEB_BASE_URL}/wall{item['owner_id']}_{item['id']}"
+            label = "Запись ВК"
+        if isinstance(url, str) and url.startswith(("https://", "http://")):
+            links.append((label, url))
+    return links
 
 
 def needs_cursor_rebase(last_seen_post_id: int | None, posts: list[VKWallPost]) -> bool:
@@ -155,9 +214,28 @@ async def with_vk_retries(operation, attempts: int = 4):
     raise AssertionError("unreachable")
 
 
-def safe_excerpt(text: str, limit: int = 320) -> str:
-    normalized = " ".join(text.split())
-    return normalized[:limit].rstrip() + ("…" if len(normalized) > limit else "")
+def _message_chunks(value: str, limit: int = 3400) -> list[str]:
+    """Split a full post into Telegram-safe chunks without dropping its text."""
+    chunks: list[str] = []
+    start = 0
+    while start < len(value):
+        end = start
+        units = 0
+        last_newline = -1
+        while end < len(value):
+            # Ебал я в рот считать эмодзи «на глаз»: Telegram меряет текст в UTF-16.
+            character_units = 2 if ord(value[end]) > 0xFFFF else 1
+            if units + character_units > limit:
+                break
+            units += character_units
+            if value[end] == "\n":
+                last_newline = end
+            end += 1
+        if end < len(value) and last_newline > start + limit // 2:
+            end = last_newline + 1
+        chunks.append(value[start:end])
+        start = end
+    return chunks
 
 
 class VKMonitor:
@@ -218,15 +296,7 @@ class VKMonitor:
             if claim is None:
                 continue
             try:
-                excerpt = safe_excerpt(post.text) if source.preview_enabled else ""
-                preview_text = f"\n\n{html.escape(excerpt)}" if excerpt else ""
-                sent = await self.messenger.send_to_allowed_topic(
-                    source.chat_id,
-                    source.target_thread_id,
-                    f'Новая публикация: <b>{html.escape(source.title)}</b>{preview_text}\n\n<a href="{post.url}">Открыть оригинал</a>',
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=not source.preview_enabled,
-                )
+                sent = await self._deliver_post(source, post)
                 await self._finish_claim(claim.id, sent.message_id)
             except Exception:
                 log.exception("vk_post_delivery_failed", source_id=source.id, post_id=post.post_id)
@@ -238,6 +308,89 @@ class VKMonitor:
             if current is not None:
                 await BotRepository(session).mark_source_checked(current, newest, reset_cursor=rebase_cursor)
                 await session.commit()
+    
+    async def _download_valid_photos(
+        self,
+        source: VKSource,
+        urls: tuple[str, ...],
+    ) -> list[BufferedInputFile]:
+        photos: list[BufferedInputFile] = []
+        skipped = 0
+
+        for index, url in enumerate(urls, start=1):
+            try:
+                async with self.client.session.get(url) as response:
+                    response.raise_for_status()
+
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                    if content_type and not content_type.startswith("image/"):
+                        raise ValueError("response is not an image")
+                    if response.content_length is not None and response.content_length > MAX_VK_PHOTO_BYTES:
+                        raise ValueError("photo is too large")
+
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        data.extend(chunk)
+                        if len(data) > MAX_VK_PHOTO_BYTES:
+                            raise ValueError("photo is too large")
+
+                if not data:
+                    raise ValueError("empty photo")
+
+                photos.append(BufferedInputFile(bytes(data), filename=f"vk-photo-{index}.jpg"))
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                skipped += 1
+                log.warning("vk_photo_skipped", source_id=source.id, photo_index=index)
+
+        if skipped:
+            await self.messenger.safe_debug_error(
+                source.chat_id,
+                f"Загрузка {skipped} фото из публикации VK",
+            )
+
+        return photos
+        
+    async def _deliver_post(self, source: VKSource, post: VKWallPost):
+        photos = await self._download_valid_photos(source, post.photos)
+        header = f'Новая публикация: <b>{html.escape(source.title)}</b>\n<a href="{post.url}">Открыть оригинал ВК</a>'
+        content = post.text if post.text.strip() else ""
+        if post.attachment_links:
+            link_lines = "\n".join(f"{label}: {url}" for label, url in post.attachment_links)
+            content = f"{content}\n\n{link_lines}" if content else link_lines
+        chunks = _message_chunks(content)
+        first_text = header + (f"\n\n{html.escape(chunks[0])}" if chunks else "")
+        sent = await self.messenger.send_to_allowed_topic(
+            source.chat_id,
+            source.target_thread_id,
+            first_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=not source.preview_enabled,
+        )
+        for chunk in chunks[1:]:
+            await self.messenger.send_to_allowed_topic(
+                source.chat_id,
+                source.target_thread_id,
+                html.escape(chunk),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=not source.preview_enabled,
+            )
+        for start in range(0, len(photos), 10):
+            batch = photos[start : start + 10]
+
+            if len(batch) == 1:
+                await self.messenger.bot.send_photo(
+                    chat_id=source.chat_id,
+                    message_thread_id=source.target_thread_id,
+                    photo=batch[0],
+                )
+            else:
+                media = [InputMediaPhoto(media=photo) for photo in batch]
+                await self.messenger.bot.send_media_group(
+                    chat_id=source.chat_id,
+                    message_thread_id=source.target_thread_id,
+                    media=media,
+                )
+        return sent
 
     async def _claim(self, source_id: int, post: VKWallPost) -> VKProcessedPost | None:
         async with self.sessions() as session:
