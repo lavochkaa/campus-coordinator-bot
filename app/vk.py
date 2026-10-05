@@ -338,7 +338,7 @@ class VKMonitor:
                     raise ValueError("empty photo")
 
                 photos.append(BufferedInputFile(bytes(data), filename=f"vk-photo-{index}.jpg"))
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            except (TimeoutError, aiohttp.ClientError, ValueError):
                 skipped += 1
                 log.warning("vk_photo_skipped", source_id=source.id, photo_index=index)
 
